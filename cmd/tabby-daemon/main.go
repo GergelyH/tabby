@@ -1876,6 +1876,7 @@ func main() {
 				if _, err := os.Stat(socketPath); os.IsNotExist(err) {
 					logEvent("SHUTDOWN_REASON session=%s reason=socket_gone pid=%d", *sessionID, myPid)
 					debugLog.Printf("Socket %s no longer exists, shutting down", socketPath)
+					selfTerminating.Store(true)
 					sigCh <- syscall.SIGTERM
 					return
 				}
@@ -1887,6 +1888,7 @@ func main() {
 					if pid, err := strconv.Atoi(pidStr); err == nil && pid != myPid {
 						logEvent("SHUTDOWN_REASON session=%s reason=pid_replaced our=%d new=%d", *sessionID, myPid, pid)
 						debugLog.Printf("PID file replaced (ours=%d, new=%d), shutting down", myPid, pid)
+						selfTerminating.Store(true)
 						sigCh <- syscall.SIGTERM
 						return
 					}

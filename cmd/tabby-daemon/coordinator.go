@@ -260,6 +260,11 @@ type Coordinator struct {
 	lastPaneMenuOpen   map[string]time.Time
 	lastPaneMenuOpenMu sync.Mutex
 
+	// Work widget state
+	workExpandedTodos map[int]bool    // todo ID -> expanded
+	workSessionMap    [5]string       // zone slot index -> session ID (for click routing)
+	workTodoMap       [5]int          // zone slot index -> todo ID (for click routing)
+
 	// Background theme detector (deprecated, kept for fallback)
 	bgDetector *colors.BackgroundDetector
 
@@ -6464,6 +6469,20 @@ func (c *Coordinator) collectWidgetEntries(width int, skipPet bool) []widgetEntr
 		})
 	}
 
+	// Work dashboard widget
+	if c.config.Widgets.Work.Enabled {
+		pos := c.config.Widgets.Work.Position
+		if pos == "" {
+			pos = "bottom"
+		}
+		entries = append(entries, widgetEntry{
+			name:     "work",
+			zone:     pos,
+			priority: c.config.Widgets.Work.Priority,
+			content:  c.renderWorkWidget(width),
+		})
+	}
+
 	entries = append(entries, widgetEntry{
 		name:     "nav_buttons",
 		zone:     "bottom",
@@ -6525,6 +6544,9 @@ func (c *Coordinator) renderWidgetZone(entries []widgetEntry, width int) (string
 		// Sidebar zones
 		"sidebar:shrink", "sidebar:grow",
 		"sidebar:prev_window", "sidebar:next_window",
+		// Work widget zones (fixed slots for dynamic content)
+		"work:todo_0", "work:todo_1", "work:todo_2", "work:todo_3", "work:todo_4",
+		"work:sess_0", "work:sess_1", "work:sess_2", "work:sess_3", "work:sess_4",
 	}
 	var regions []daemon.ClickableRegion
 	for _, zoneID := range knownZones {
@@ -7013,6 +7035,211 @@ func (c *Coordinator) getClaudeUsageStats(dbPath string) (today, week, month, to
 	}
 
 	return today, week, month, total, msgCount
+}
+
+// workState mirrors the JSON structure of ~/.claude/work-state.json
+type workState struct {
+	Sessions []workSession `json:"sessions"`
+	Todos    []workTodo    `json:"todos"`
+}
+
+type workSession struct {
+	ID         string `json:"id"`
+	Title      string `json:"title"`
+	CWD        string `json:"cwd"`
+	LastActive string `json:"last_active"`
+	Summary    string `json:"summary"`
+}
+
+type workTodo struct {
+	ID        int    `json:"id"`
+	Title     string `json:"title"`
+	Status    string `json:"status"`
+	Details   string `json:"details"`
+	Project   string `json:"project"`
+	Created   string `json:"created"`
+	Completed string `json:"completed"`
+}
+
+// renderWorkWidget renders the work dashboard: TODOs + recent Claude sessions.
+// TODOs are clickable (expand/collapse details). Sessions are clickable (focus window or resume).
+func (c *Coordinator) renderWorkWidget(width int) string {
+	cfg := c.config.Widgets.Work
+	if !cfg.Enabled {
+		return ""
+	}
+
+	if c.workExpandedTodos == nil {
+		c.workExpandedTodos = make(map[int]bool)
+	}
+
+	var result strings.Builder
+
+	for i := 0; i < cfg.MarginTop; i++ {
+		result.WriteString("\n")
+	}
+
+	divider := cfg.Divider
+	if divider == "" {
+		divider = "─"
+	}
+	dividerFg := c.getInactiveTextColorWithFallback(cfg.DividerFg)
+	dividerStyle := lipgloss.NewStyle()
+	if dividerFg != "" {
+		dividerStyle = dividerStyle.Foreground(lipgloss.Color(dividerFg))
+	}
+	dividerWidth := lipgloss.Width(divider)
+	if dividerWidth > 0 {
+		result.WriteString(dividerStyle.Render(strings.Repeat(divider, width/dividerWidth)) + "\n")
+	}
+
+	for i := 0; i < cfg.PaddingTop; i++ {
+		result.WriteString("\n")
+	}
+
+	statePath := cfg.StatePath
+	if statePath == "" {
+		homeDir, _ := os.UserHomeDir()
+		statePath = filepath.Join(homeDir, ".claude", "work-state.json")
+	}
+
+	state := c.readWorkState(statePath)
+
+	labelFg := c.getInactiveTextColorWithFallback(cfg.Fg)
+	headerFg := cfg.HeaderFg
+	if headerFg == "" {
+		headerFg = "#7aa2f7"
+	}
+	todoFg := cfg.TodoFg
+	if todoFg == "" {
+		todoFg = labelFg
+	}
+	sessionFg := cfg.SessionFg
+	if sessionFg == "" {
+		sessionFg = "#888888"
+	}
+	doneFg := cfg.DoneFg
+	if doneFg == "" {
+		doneFg = "#666666"
+	}
+
+	headerStyle := lipgloss.NewStyle().Foreground(lipgloss.Color(headerFg)).Bold(true)
+	todoStyle := lipgloss.NewStyle().Foreground(lipgloss.Color(todoFg))
+	doneStyle := lipgloss.NewStyle().Foreground(lipgloss.Color(doneFg))
+	_ = labelFg
+	_ = sessionFg
+
+	style := cfg.Style
+	if style == "" {
+		style = "nerd"
+	}
+	icon := ""
+	switch style {
+	case "nerd":
+		icon = " "
+	case "emoji":
+		icon = "📋 "
+	case "ascii":
+		icon = "[W] "
+	}
+
+	result.WriteString(headerStyle.Render(icon+"Work") + "\n")
+
+	// --- TODOs ---
+	showTodos := cfg.ShowTodos
+	if !showTodos && !cfg.ShowSessions {
+		showTodos = true
+	}
+	maxTodos := cfg.MaxTodos
+	if maxTodos == 0 {
+		maxTodos = 5
+	}
+	if maxTodos > 5 {
+		maxTodos = 5
+	}
+
+	// Build set of active todo_ids from cached window list. Active TODOs are
+	// rendered as their own tmux groups in the sidebar above, so the Work
+	// widget only shows the backlog (TODOs without any associated window).
+	activeTodoIDs := make(map[string]bool)
+	for i := range c.windows {
+		if c.windows[i].TodoID != "" {
+			activeTodoIDs[c.windows[i].TodoID] = true
+		}
+	}
+
+	if showTodos && len(state.Todos) > 0 {
+		slot := 0
+		for _, todo := range state.Todos {
+			if slot >= maxTodos || todo.Status == "done" {
+				continue
+			}
+			todoIDStr := strconv.Itoa(todo.ID)
+			if activeTodoIDs[todoIDStr] {
+				continue // active TODOs are shown as groups above
+			}
+
+			titleLine := fmt.Sprintf(" ○ %s", truncateToWidth(todo.Title, width-4))
+			zoneID := fmt.Sprintf("work:todo_%d", slot)
+			c.workTodoMap[slot] = todo.ID
+			result.WriteString(zone.Mark(zoneID, todoStyle.Render(titleLine)+"\n"))
+			slot++
+		}
+
+		// Done items (compact, no click zones needed)
+		doneCount := 0
+		for _, todo := range state.Todos {
+			if doneCount >= 2 || todo.Status != "done" {
+				continue
+			}
+			line := fmt.Sprintf(" ✓ %s", truncateToWidth(todo.Title, width-4))
+			result.WriteString(doneStyle.Render(line) + "\n")
+			doneCount++
+		}
+	}
+
+	for i := 0; i < cfg.PaddingBot; i++ {
+		result.WriteString("\n")
+	}
+	for i := 0; i < cfg.MarginBot; i++ {
+		result.WriteString("\n")
+	}
+
+	return result.String()
+}
+
+// readWorkState reads and parses the work-state.json file
+func (c *Coordinator) readWorkState(path string) workState {
+	var state workState
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return state
+	}
+	_ = json.Unmarshal(data, &state)
+	return state
+}
+
+// truncateToWidth truncates a string to fit within maxWidth visible columns
+func truncateToWidth(s string, maxWidth int) string {
+	if maxWidth < 1 {
+		return ""
+	}
+	w := runewidth.StringWidth(s)
+	if w <= maxWidth {
+		return s
+	}
+	result := ""
+	current := 0
+	for _, r := range s {
+		rw := runewidth.RuneWidth(r)
+		if current+rw > maxWidth-1 {
+			result += "…"
+			break
+		}
+		result += string(r)
+		current += rw
+	}
+	return result
 }
 
 // constrainWidgetWidth ensures all lines in widget content don't exceed maxWidth
@@ -8629,6 +8856,141 @@ func (c *Coordinator) handleSemanticAction(clientID string, input *daemon.InputP
 		c.stateMu.Unlock()
 		savePetStateData(petSnap)
 		return false // Pet action, no window refresh needed
+
+	case "todo_0", "todo_1", "todo_2", "todo_3", "todo_4":
+		// Activate a TODO: focus existing tagged window, or create a new one
+		slotStr := strings.TrimPrefix(input.ResolvedAction, "todo_")
+		slot, _ := strconv.Atoi(slotStr)
+		if slot >= 0 && slot < 5 {
+			todoID := c.workTodoMap[slot]
+			if todoID > 0 {
+				todoIDStr := strconv.Itoa(todoID)
+				// Find a window already tagged with this todo_id
+				found := false
+				listOut, listErr := tmuxOutputCtx("list-windows", "-F",
+					"#{window_index}\x1f#{@todo_id}")
+				if listErr == nil {
+					for _, line := range strings.Split(strings.TrimSpace(string(listOut)), "\n") {
+						parts := strings.SplitN(line, "\x1f", 2)
+						if len(parts) == 2 && parts[1] == todoIDStr {
+							tmuxRun("select-window", "-t", ":"+parts[0])
+							found = true
+							break
+						}
+					}
+				}
+				if !found {
+					// No window for this TODO: create one and tag it.
+					// We capture the new window's ID from new-window and target all
+					// subsequent set-window-option calls with -t. Without this, rapid
+					// clicks race because set-window-option targets the "current" window,
+					// which may not have caught up with the new-window switch yet.
+					homeDir, _ := os.UserHomeDir()
+					sp := c.config.Widgets.Work.StatePath
+					if sp == "" {
+						sp = filepath.Join(homeDir, ".claude", "work-state.json")
+					}
+					st := c.readWorkState(sp)
+					winName := "todo"
+					groupName := fmt.Sprintf("TODO %d", todoID)
+					for _, t := range st.Todos {
+						if t.ID == todoID {
+							if t.Title != "" {
+								groupName = t.Title
+								if len(groupName) > 22 {
+									groupName = groupName[:22]
+								}
+							}
+							winName = groupName
+							break
+						}
+					}
+					// Use -P -F to print the new window's ID so we can target it explicitly.
+					out, err := tmuxOutputCtx("new-window", "-P", "-F", "#{window_id}", "-n", winName)
+					if err == nil {
+						winID := strings.TrimSpace(string(out))
+						if winID != "" {
+							tmuxRun("set-window-option", "-t", winID, "automatic-rename", "off")
+							tmuxRun("set-window-option", "-t", winID, "@tabby_name_locked", "1")
+							tmuxRun("set-window-option", "-t", winID, "@todo_id", todoIDStr)
+							tmuxRun("set-window-option", "-t", winID, "@tabby_group", groupName)
+							// Re-assert the name in case auto-rename fired before we disabled it.
+							tmuxRun("rename-window", "-t", winID, winName)
+						}
+					}
+				}
+			}
+		}
+		return true
+
+	case "sess_0", "sess_1", "sess_2", "sess_3", "sess_4":
+		// Click on a recent session: find matching tmux window or open popup to resume
+		slotStr := strings.TrimPrefix(input.ResolvedAction, "sess_")
+		slot, _ := strconv.Atoi(slotStr)
+		if slot >= 0 && slot < 5 {
+			sessID := c.workSessionMap[slot]
+			if sessID != "" {
+				// Check if any tmux window has this session running
+				found := false
+				listCtx, listCancel := context.WithTimeout(context.Background(), 2*time.Second)
+				out, err := exec.CommandContext(listCtx, "tmux", "list-windows", "-F",
+					"#{window_index}\x1f#{window_name}\x1f#{pane_current_command}").Output()
+				listCancel()
+				if err == nil {
+					for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+						parts := strings.SplitN(line, "\x1f", 3)
+						if len(parts) >= 1 {
+							// Look for a window running claude with this session
+							winIdx := parts[0]
+							// Check pane env for matching session ID
+							checkCtx, checkCancel := context.WithTimeout(context.Background(), 1*time.Second)
+							envOut, envErr := exec.CommandContext(checkCtx, "tmux", "list-panes", "-t", ":"+winIdx,
+								"-F", "#{pane_id}\x1f#{pane_current_command}").Output()
+							checkCancel()
+							if envErr == nil {
+								for _, pLine := range strings.Split(string(envOut), "\n") {
+									pParts := strings.SplitN(strings.TrimSpace(pLine), "\x1f", 2)
+									if len(pParts) == 2 && strings.Contains(pParts[1], "claude") {
+										// Found a pane running claude in this window -- focus it
+										exec.Command("tmux", "select-window", "-t", ":"+winIdx).Run()
+										exec.Command("tmux", "select-pane", "-t", pParts[0]).Run()
+										found = true
+										break
+									}
+								}
+							}
+							if found {
+								break
+							}
+						}
+					}
+				}
+				if !found {
+					// No matching window: open a new tmux window to resume the session
+					homeDir, _ := os.UserHomeDir()
+					sp := c.config.Widgets.Work.StatePath
+					if sp == "" {
+						sp = filepath.Join(homeDir, ".claude", "work-state.json")
+					}
+					st := c.readWorkState(sp)
+					winName := "claude"
+					for _, s := range st.Sessions {
+						if s.ID == sessID && s.Title != "" {
+							t := s.Title
+							if len(t) > 25 {
+								t = t[:25]
+							}
+							winName = t
+							break
+						}
+					}
+					exec.Command("tmux", "new-window", "-n", winName,
+						fmt.Sprintf("claude -r %s || { echo 'Session not found.'; read; }", sessID),
+					).Run()
+				}
+			}
+		}
+		return true
 
 	case "shrink_sidebar", "shrink":
 		// Shrink sidebar width by 5 columns (min 15)

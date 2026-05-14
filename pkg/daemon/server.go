@@ -85,6 +85,9 @@ func (s *Server) Start() error {
 		os.Remove(s.pidPath) // Clean up pidfile on failure
 		return fmt.Errorf("failed to listen on socket: %w", err)
 	}
+	// Prevent listener.Close() from deleting the socket file — Stop() handles
+	// cleanup with a pid-ownership check to avoid removing a new daemon's socket.
+	listener.(*net.UnixListener).SetUnlinkOnClose(false)
 	s.listener = listener
 
 	// Accept connections in goroutine

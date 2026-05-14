@@ -41,6 +41,7 @@ type Widgets struct {
 	Session SessionWidget `yaml:"session"`
 	Stats   StatsWidget   `yaml:"stats"`
 	Claude  ClaudeWidget  `yaml:"claude"`
+	Work    WorkWidget    `yaml:"work"`
 }
 
 // StatsWidget shows system stats (CPU, memory, battery)
@@ -92,6 +93,33 @@ type ClaudeWidget struct {
 	PaddingBot     int    `yaml:"padding_bottom"`  // Blank lines below content
 	MarginTop      int    `yaml:"margin_top"`      // Lines above top divider
 	MarginBot      int    `yaml:"margin_bottom"`   // Lines below bottom divider
+}
+
+// WorkWidget shows a dashboard of TODOs and recent Claude sessions
+type WorkWidget struct {
+	Enabled        bool   `yaml:"enabled"`
+	Style          string `yaml:"style"`            // nerd | emoji | ascii | minimal
+	StatePath      string `yaml:"state_path"`       // Path to work-state.json (default: ~/.claude/work-state.json)
+	MaxTodos       int    `yaml:"max_todos"`        // Max TODOs to show (default: 5)
+	MaxSessions    int    `yaml:"max_sessions"`     // Max recent sessions to show (default: 5)
+	ShowSessions   bool   `yaml:"show_sessions"`    // Show recent sessions section (default: true)
+	ShowTodos      bool   `yaml:"show_todos"`       // Show TODOs section (default: true)
+	UpdateInterval int    `yaml:"update_interval"`  // Seconds between updates (default: 10)
+	Position       string `yaml:"position"`         // top | bottom
+	Pin            bool   `yaml:"pin"`              // Pin to position
+	Priority       int    `yaml:"priority"`         // Order among widgets
+	Fg             string `yaml:"fg"`               // Text color
+	Bg             string `yaml:"bg"`               // Background color
+	TodoFg         string `yaml:"todo_fg"`          // TODO item color
+	SessionFg      string `yaml:"session_fg"`       // Session item color
+	HeaderFg       string `yaml:"header_fg"`        // Section header color
+	DoneFg         string `yaml:"done_fg"`          // Done item color
+	Divider        string `yaml:"divider"`          // Divider line above widget
+	DividerFg      string `yaml:"divider_fg"`       // Divider color
+	PaddingTop     int    `yaml:"padding_top"`
+	PaddingBot     int    `yaml:"padding_bottom"`
+	MarginTop      int    `yaml:"margin_top"`
+	MarginBot      int    `yaml:"margin_bottom"`
 }
 
 // SessionWidget shows tmux session info

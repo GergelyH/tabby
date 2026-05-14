@@ -68,6 +68,17 @@ func GroupWindowsWithOptions(windows []tmux.Window, groups []config.Group, inclu
 		// Find the target group
 		if targetGroup, ok := groupMap[groupName]; ok {
 			targetGroup.Windows = append(targetGroup.Windows, win)
+		} else if win.TodoID != "" && win.Group != "" {
+			// Work dashboard TODO-activated windows get auto-created dynamic groups
+			// when their @tabby_group doesn't match a configured group. This is
+			// gated on TodoID so accidental @tabby_group typos still fall back.
+			dyn := &GroupedWindows{
+				Name:    groupName,
+				Theme:   config.Theme{}, // empty theme; rendering layer fills defaults from palette
+				Windows: []tmux.Window{win},
+			}
+			groupMap[groupName] = dyn
+			result = append(result, dyn)
 		} else {
 			// Group not found in config, fall back to Default
 			if defaultGroup, ok := groupMap["Default"]; ok {
